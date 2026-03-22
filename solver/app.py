@@ -271,7 +271,9 @@ def _build_options(
                             pattern_id,
                             tuple(timeslot_set),
                             room["id"],
-                            room["capacity"] - section_dict["expected_enrollment"],
+                            # Clamp room waste to 0 to prevent negative values when capacity constraints are relaxed during diagnostics. Without this, overcapacity rooms would receive a reward instead of a penalty, corrupting the objective
+                            max(0, room["capacity"] - section_dict["expected_enrollment"]) #ADDED
+                            #not required: room["capacity"] - section_dict["expected_enrollment"],
                         )
                     )
 
@@ -678,8 +680,10 @@ def _solve_schedule(input_data: SchedulingInput):
             instructor_day_vars[(instructor_id, day)] = day_var
             day_vars.append(day_var)
         excess = model.NewIntVar(0, len(unique_days), f"excess_{instructor_id}")
-        model.Add(excess >= sum(day_vars) - max_teaching_days)
-        model.Add(excess >= 0)
+        #model.Add(excess >= sum(day_vars) - max_teaching_days)
+        #model.Add(excess >= 0)
+        # Replaces two lower-bound constraints with an exact equality: excess = max(days_used - max_teaching_days, 0). More precise CP-SAT modeling.
+        model.AddMaxEquality(excess, [sum(day_vars) - max_teaching_days, model.NewConstant(0)]) #ADDED
         adjunct_day_excess_vars[instructor_id] = excess
         penalty_terms.append(excess * ADJUNCT_DAY_EXCESS_WEIGHT)
 
@@ -701,6 +705,8 @@ def _solve_schedule(input_data: SchedulingInput):
         pref_pattern_penalty = (
             0 if pattern_id in preferred_patterns else PREF_PATTERN_WEIGHT
         )
+        # Redefined here so the variable exists in this loop's scope and is captured in the breakdown
+        pref_time_penalty = 0  # no section_preferences in this version, so always 0 for now
         total_penalty = (
             room_waste * ROOM_WASTE_WEIGHT + pref_day_penalty + pref_pattern_penalty
         )
@@ -738,7 +744,8 @@ def _solve_schedule(input_data: SchedulingInput):
                 weight = soft_lock.get("weight") if isinstance(soft_lock, dict) else getattr(soft_lock, "weight", 1.0)
                 soft_penalty += weight * SOFT_LOCK_BASE_WEIGHT
         if soft_penalty > 0:
-            penalty_terms.append(var * int(soft_penalty))
+            #CP-SAT requires integer coefficients. User-supplied soft lock weights are floats, so we scale by 100 and round instead of using int(), which would  truncate (weight 1.9 becomes 1, losing ~50% of the penalty)
+            penalty_terms.append(var * round(soft_penalty * 100))
 
     # Minimize total penalty.
     model.Minimize(sum(penalty_terms))
@@ -770,6 +777,7 @@ def _solve_schedule(input_data: SchedulingInput):
         "adjunct_day_excess": 0.0,
         "soft_lock_time": 0.0,
         "soft_lock_room": 0.0,
+        "section_pref_time": 0.0 #ADDED
     }
 
     for section_id, options in options_by_section.items():
@@ -796,8 +804,10 @@ def _solve_schedule(input_data: SchedulingInput):
         pref_pattern_penalty = (
             0 if pattern_id in preferred_patterns else PREF_PATTERN_WEIGHT
         )
+        pref_time_penalty = 0  # added this line
         penalty_breakdown["room_waste"] += float(room_waste * ROOM_WASTE_WEIGHT)
         penalty_breakdown["instructor_day_preference"] += float(pref_day_penalty)
+        penalty_breakdown["section_pref_time"] += float(pref_time_penalty) #ADDED
         penalty_breakdown["instructor_pattern_preference"] += float(
             pref_pattern_penalty
         )
