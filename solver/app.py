@@ -79,7 +79,7 @@ def _section_to_dict(section) -> dict:
         "tags": getattr(section, "tags", []),
     }
 
-
+# Added is_virtual flag so the solver can distinguish virtual rooms from physical ones and skip irrelevant constraints like capacity and features
 def _room_to_dict(room) -> dict:
     """Convert room (dict or model) to dict."""
     if isinstance(room, dict):
@@ -89,7 +89,18 @@ def _room_to_dict(room) -> dict:
         "building": room.building,
         "capacity": room.capacity,
         "features": getattr(room, "features", []),
+        "is_virtual": getattr(room, "is_virtual", False),
     }
+# def _room_to_dict(room) -> dict:
+#     """Convert room (dict or model) to dict."""
+#     if isinstance(room, dict):
+#         return room
+#     return room.to_dict() if hasattr(room, "to_dict") else {
+#         "id": room.id,
+#         "building": room.building,
+#         "capacity": room.capacity,
+#         "features": getattr(room, "features", []),
+#     }
 
 
 def _instructor_to_dict(instructor) -> dict:
@@ -228,15 +239,47 @@ def _build_options(
         section_id = section_dict["id"]
         lock = locked_by_section.get(section_id)
         available_rooms = []
+        # Check if this section's department allows virtual rooms
+        section_course_id = section_dict.get("course_id")
+        courses_by_id_local = {}
+        for course in getattr(input_data, "courses", []) or []:
+            course_dict = course.to_dict() if hasattr(course, "to_dict") else course
+            if isinstance(course_dict, dict) and course_dict.get("id"):
+                courses_by_id_local[course_dict["id"]] = course_dict
+        section_course = courses_by_id_local.get(section_course_id, {})
+        section_dept = section_course.get("department")
+        dept_allows_virtual = True
+        for dept_pref in getattr(input_data, "department_preferences", []) or []:
+            dept_pref_dict = dept_pref.to_dict() if hasattr(dept_pref, "to_dict") else dept_pref
+            if isinstance(dept_pref_dict, dict) and dept_pref_dict.get("department") == section_dept:
+                dept_allows_virtual = dept_pref_dict.get("allow_virtual", True)
+                break
+        # If a department has allow_virtual=False, virtual rooms are filtered out before options are built for that section. Virtual rooms that are allowed bypass capacity and feature checks since those constraints are physical only.
         for room in input_data.rooms:
             room_dict = _room_to_dict(room)
-            if not ignore_room_capacity and room_dict["capacity"] < section_dict["expected_enrollment"]:
+            is_virtual = room_dict.get("is_virtual", False)
+            # Skip virtual rooms if department does not allow them
+            if is_virtual and not dept_allows_virtual:
                 continue
-            if not ignore_room_features and not _has_required_features(
-                room_dict, section_dict.get("room_requirements", [])
-            ):
-                continue
+            # Virtual rooms bypass physical capacity and feature checks
+            if not is_virtual:
+                if not ignore_room_capacity and room_dict["capacity"] < section_dict["expected_enrollment"]:
+                    continue
+                if not ignore_room_features and not _has_required_features(
+                    room_dict, section_dict.get("room_requirements", [])
+                ):
+                    continue
             available_rooms.append(room_dict)
+        # available_rooms = []
+        # for room in input_data.rooms:
+        #     room_dict = _room_to_dict(room)
+        #     if not ignore_room_capacity and room_dict["capacity"] < section_dict["expected_enrollment"]:
+        #         continue
+        #     if not ignore_room_features and not _has_required_features(
+        #         room_dict, section_dict.get("room_requirements", [])
+        #     ):
+        #         continue
+        #     available_rooms.append(room_dict)
         crosslist_id = section_dict.get("crosslist_group_id")
         if crosslist_id:
             required_capacity = crosslist_totals.get(crosslist_id, 0)
@@ -572,6 +615,10 @@ def _solve_schedule(input_data: SchedulingInput):
     for room in input_data.rooms:
         room_dict = _room_to_dict(room)
         room_id = room_dict["id"]
+        # Virtual rooms have no physical capacity limit so multiple sections
+        # can share one simultaneously. Skip conflict constraints for them.
+        if room_dict.get("is_virtual", False):
+            continue
         for timeslot in input_data.timeslots:
             timeslot_dict = timeslot.to_dict() if hasattr(timeslot, "to_dict") else timeslot
             timeslot_id = timeslot_dict.get("id") if isinstance(timeslot_dict, dict) else timeslot.id
